@@ -97,6 +97,11 @@ private:
                         bool   is_return_context_cum_log_probs);
     void freeBuffer() override;
 
+    size_t kv_cache_size = 0;
+
+    void offloading();
+    void uploading();
+
     void initialize();
 
     void computeContextCumLogProbs(float*                      cum_log_probs,

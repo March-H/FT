@@ -27,7 +27,57 @@
 #include "src/fastertransformer/utils/nvtx_utils.h"
 #include "src/fastertransformer/scheduling/scheduler.h"
 
+#include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAFunctions.h>
+#include <torch/custom_class.h>
+//#include "torch/script.h"
+//#include "torch/torch.h"
+
 namespace fastertransformer {
+
+double get_gpu_free(int device = 0){
+    // get the actual GPU memory available to torch (MB)
+    size_t cuda_free, cuda_total;
+    cudaSetDevice(device);
+    cudaMemGetInfo(&cuda_free, &cuda_total);
+    auto type  = c10::cuda::CUDACachingAllocator::StatType::AGGREGATE;
+    auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(device);
+    size_t torch_free = stats.reserved_bytes[static_cast<int>(type)].current
+                        - stats.allocated_bytes[static_cast<int>(type)].current;
+    auto free = double(cuda_free + torch_free);
+    return free / (1024.0 * 1024.0);
+}
+
+double get_gpu_allocated(int device = 0){
+    // get the actual GPU memory allocated by torch and other programs (MB)
+    size_t cuda_free, cuda_total;
+    cudaSetDevice(device);
+    cudaMemGetInfo(&cuda_free, &cuda_total);
+    auto type  = c10::cuda::CUDACachingAllocator::StatType::AGGREGATE;
+    auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(device);
+    auto allocated = double((cuda_total - cuda_free) + stats.allocated_bytes[static_cast<int>(type)].current);
+    return allocated / (1024.0 * 1024.0);
+}
+
+/* async offloading or uploading:
+ *   - #include <future>
+ *   - task = std::async(std::launch::async, offloading);
+ *   - task.wait();
+ */
+
+template<typename T>
+void ParallelGpt<T>::offloading()
+{
+    // sync offloading
+    key_cache_ = (T*)allocator_->moveTo(key_cache_, sizeof(T) * kv_cache_size * 2, true);
+}
+
+template<typename T>
+void ParallelGpt<T>::uploading()
+{
+    // sync uploading
+    key_cache_ = (T*)allocator_->moveTo(key_cache_, sizeof(T) * kv_cache_size * 2, false);
+}
 
 template<typename T>
 void ParallelGpt<T>::initialize()
@@ -1110,7 +1160,7 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
             auto tmpStart = NOW;
             gpt_context_decoder_->forward(
                 &decoder_output_tensors, &decoder_input_tensors, &gpt_weights->decoder_layer_weights);
-//            FT_LOG_INFO("Before generating the first token, the context_decoder cost %lfms", DURATION(tmpStart));
+            FT_LOG_INFO("Before generating the first token, the context_decoder cost %lfms", DURATION(tmpStart));
 
             if (is_return_context_embeddings) {
                 PUSH_RANGE("context embedding sum length dim");
@@ -1607,7 +1657,7 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
         auto duration = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>( end-start);
         start = end;
 
-//        FT_LOG_INFO("token-{%d}, time = {%lf}ms",step_,duration.count());
+        FT_LOG_INFO("token-{%d}, time = {%lf}ms",step_,duration.count());
 
         /*if(step_==step_start){
             FT_LOG_INFO("token-{%d}, time = {%lf}ms",step_,duration.count());

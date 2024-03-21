@@ -70,6 +70,7 @@ public:
     virtual void         setStream(cudaStream_t stream)                                           = 0;
     virtual cudaStream_t returnStream()                                                           = 0;
     virtual void         memSet(void* ptr, const int val, const size_t size)                      = 0;
+    virtual void*        moveTo(void* ptr, size_t size, bool to_host = true) = 0;
 
     template<typename T>
     void* reMalloc(T* ptr, size_t size, const bool is_set_zero = true, bool is_host = false)
@@ -199,6 +200,8 @@ public:
     {
         return stream_;
     };
+
+    void* moveTo(void* ptr, size_t size, bool to_host) override{return nullptr;}
 
     void* malloc(size_t size, const bool is_set_zero = true, bool is_host = false)
     {
@@ -434,6 +437,28 @@ public:
         }
         FT_LOG_DEBUG("malloc buffer %p with size %ld", ptr, buf_size);
         pointer_mapping_->insert({getAddress(ptr), buf});
+        return ptr;
+    }
+
+    void* moveTo(void* ptr, size_t size, bool to_host = true)
+    {
+        // offloading GPU tensor to CPU  &&  uploading CPU tensor to GPU
+        // synchronous offloading & uplaoding
+        // use std::async (include<future>) for async offloading & uploading
+        if(to_host){
+            torch::Tensor buf = torch::from_blob(ptr, {(int)size}, torch::dtype(torch::kUInt8).device(torch::kCUDA));
+            buf = buf.to(torch::kCPU, true);
+            free((void**)(&ptr));
+            ptr = buf.data_ptr();
+            pointer_mapping_->insert({getAddress(ptr), buf});   // prevent being released
+        }
+        else{
+            torch::Tensor buf = torch::from_blob(ptr, {(int)size}, torch::dtype(torch::kUInt8).device(torch::kCPU));
+            buf = buf.to(torch::kCUDA, true);
+            free((void**)(&ptr));
+            ptr = buf.data_ptr();
+            pointer_mapping_->insert({getAddress(ptr), buf});   // prevent being released
+        }
         return ptr;
     }
 
