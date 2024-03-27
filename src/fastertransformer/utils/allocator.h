@@ -77,10 +77,12 @@ public:
     {
         FT_LOG_DEBUG(__PRETTY_FUNCTION__);
         size              = ((size + 31) / 32) * 32;  // make the buffer align with 32 bytes
+
         void* void_ptr    = (void*)ptr;
         void* ptr_address = getAddress(void_ptr);
         if (isExist(ptr_address)) {
             ReallocType realloc_type = isReMalloc(ptr_address, size);
+//            FT_LOG_INFO("realloc type is %d.",realloc_type);
             if (realloc_type == ReallocType::INCREASE) {
                 FT_LOG_DEBUG("ReMalloc the buffer %p since it is too small.", void_ptr);
                 free((void**)(&void_ptr), is_host);
@@ -445,20 +447,33 @@ public:
         // offloading GPU tensor to CPU  &&  uploading CPU tensor to GPU
         // synchronous offloading & uplaoding
         // use std::async (include<future>) for async offloading & uploading
+//        FT_LOG_INFO("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
         if(to_host){
+//            FT_LOG_INFO("[ptr.before to_host] %p",ptr);
             torch::Tensor buf = torch::from_blob(ptr, {(int)size}, torch::dtype(torch::kUInt8).device(torch::kCUDA));
-            buf = buf.to(torch::kCPU, true);
+//            FT_LOG_INFO("[buf.before to_host] %p",buf.data_ptr());
+            buf = buf.to(torch::kCPU, false, true);
+//            FT_LOG_INFO("[buf.after to_host] %p",buf.data_ptr());
+//            if(!buf.is_cuda()){
+//                FT_LOG_INFO("The tensor is now on CPU.");
+//            }
             free((void**)(&ptr));
             ptr = buf.data_ptr();
             pointer_mapping_->insert({getAddress(ptr), buf});   // prevent being released
-        }
-        else{
+        }else{
+//            FT_LOG_INFO("[ptr.before to_cuda] %p",ptr);
             torch::Tensor buf = torch::from_blob(ptr, {(int)size}, torch::dtype(torch::kUInt8).device(torch::kCPU));
-            buf = buf.to(torch::kCUDA, true);
+//            FT_LOG_INFO("[buf.before to_cuda] %p",buf.data_ptr());
+            buf = buf.to(torch::kCUDA, false, true);
+//            FT_LOG_INFO("[buf.after to_cuda] %p",buf.data_ptr());
+//            if(buf.is_cuda()){
+//                FT_LOG_INFO("The tensor is now on GPU %d",buf.get_device());
+//            }
             free((void**)(&ptr));
             ptr = buf.data_ptr();
             pointer_mapping_->insert({getAddress(ptr), buf});   // prevent being released
         }
+//        torch::cuda::synchronize();
         return ptr;
     }
 

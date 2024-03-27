@@ -31,7 +31,7 @@
 #include <c10/cuda/CUDAFunctions.h>
 #include <torch/custom_class.h>
 //#include "torch/script.h"
-//#include "torch/torch.h"
+//#include <torch/torch.h>
 
 namespace fastertransformer {
 
@@ -50,12 +50,24 @@ double get_gpu_free(int device = 0){
 
 double get_gpu_allocated(int device = 0){
     // get the actual GPU memory allocated by torch and other programs (MB)
+//    size_t cuda_free, cuda_total;
+//    cudaSetDevice(device);
+//    cudaMemGetInfo(&cuda_free, &cuda_total);
+//    auto type  = c10::cuda::CUDACachingAllocator::StatType::AGGREGATE;
+//    auto states = c10::cuda::CUDACachingAllocator::getDeviceStats(device);
+//    auto allocated = double((cuda_total - cuda_free) + states.allocated_bytes[static_cast<int>(type)].current);
+//    return allocated / (1024.0 * 1024.0);
+
     size_t cuda_free, cuda_total;
     cudaSetDevice(device);
     cudaMemGetInfo(&cuda_free, &cuda_total);
-    auto type  = c10::cuda::CUDACachingAllocator::StatType::AGGREGATE;
-    auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(device);
-    auto allocated = double((cuda_total - cuda_free) + stats.allocated_bytes[static_cast<int>(type)].current);
+//    FT_LOG_INFO("CUDA_total is %lf MB.",cuda_total/1024.0/1024.0);
+    auto type      = c10::cuda::CUDACachingAllocator::StatType::AGGREGATE;
+    auto stats     = c10::cuda::CUDACachingAllocator::getDeviceStats(device);
+    auto allocated = double((cuda_total - cuda_free)
+                            - stats.reserved_bytes[static_cast<int>(type)].current
+                            + stats.allocated_bytes[static_cast<int>(type)].current
+                            );
     return allocated / (1024.0 * 1024.0);
 }
 
@@ -69,14 +81,18 @@ template<typename T>
 void ParallelGpt<T>::offloading()
 {
     // sync offloading
+//    FT_LOG_INFO("[BEFORE OFFLOADING]The pointer address is %p",key_cache_);
     key_cache_ = (T*)allocator_->moveTo(key_cache_, sizeof(T) * kv_cache_size * 2, true);
+//    FT_LOG_INFO("[AFTER OFFLOADING]The pointer address is %p",key_cache_);
 }
 
 template<typename T>
 void ParallelGpt<T>::uploading()
 {
     // sync uploading
+//    FT_LOG_INFO("[BEFORE UPLOADING]The pointer address is %p",key_cache_);
     key_cache_ = (T*)allocator_->moveTo(key_cache_, sizeof(T) * kv_cache_size * 2, false);
+//    FT_LOG_INFO("[AFTER UPLOADING]The pointer address is %p",key_cache_);
 }
 
 template<typename T>
@@ -160,12 +176,17 @@ void ParallelGpt<T>::allocateBuffer(size_t batch_size,
 
     const size_t self_cache_size =
         (num_layer_ / pipeline_para_.world_size_) * batchxbeam * memory_len * hidden_units_ / tensor_para_.world_size_;
+    kv_cache_size = self_cache_size;
 
+    // the four parameters are the same in each session.
+
+    // if padded size do not equal to vocab_size_, need to allocate the size to padded size.
     if (vocab_size_ != vocab_size_padded_) {
         padded_embedding_kernel_ =
             (T*)(allocator_->reMalloc(padded_embedding_kernel_, sizeof(T) * hidden_units_ * vocab_size_padded_, true));
         padded_embedding_kernel_ptr_ = padded_embedding_kernel_;
     }
+
 
     tiled_input_attention_mask_ = (T*)(allocator_->reMalloc(
         tiled_input_attention_mask_, sizeof(T) * batchxbeam * max_input_len * max_input_len, false));
@@ -177,14 +198,25 @@ void ParallelGpt<T>::allocateBuffer(size_t batch_size,
     normed_decoder_output_buf_ =
         (T*)(allocator_->reMalloc(normed_decoder_output_buf_, sizeof(T) * batchxbeam * hidden_units_, false));
     logits_buf_ = (float*)(allocator_->reMalloc(logits_buf_, sizeof(float) * batchxbeam * vocab_size_padded_, false));
+//    double tmp0 = get_gpu_allocated();
+
+    // This part and kv-cache memory are diffenrent between first iteration and other iterations.
     nccl_logits_buf_ =
         (float*)(allocator_->reMalloc(nccl_logits_buf_, sizeof(float) * batchxbeam * vocab_size_padded_, false));
+//    double tmp1 = get_gpu_allocated();
+
     cum_log_probs_    = (float*)(allocator_->reMalloc(cum_log_probs_, sizeof(float) * batchxbeam, false));
     finished_buf_     = (bool*)(allocator_->reMalloc(finished_buf_, sizeof(bool) * batchxbeam, false));
     sequence_lengths_ = (int*)(allocator_->reMalloc(sequence_lengths_, sizeof(int) * batchxbeam, false));
 
+    double key_cache_gpu_cost = get_gpu_allocated();
     key_cache_   = (T*)(allocator_->reMalloc(key_cache_, sizeof(T) * self_cache_size * 2, true));
     value_cache_ = key_cache_ + self_cache_size;
+    FT_LOG_INFO("key_cache_gpu_cost(in allocateBuffer) is %lf MB.",key_cache_gpu_cost = get_gpu_allocated() - key_cache_gpu_cost);
+//    double tmp2 = get_gpu_allocated();
+//    FT_LOG_INFO("%lu %lu",sizeof(float) * batchxbeam * vocab_size_padded_, sizeof(T) * self_cache_size * 2);
+//    FT_LOG_INFO("%lfMB",tmp2-tmp1);
+
     if (beam_width > 1) {
         cache_indirections_[0] =
             (int*)(allocator_->reMalloc(cache_indirections_[0], sizeof(int) * batchxbeam * memory_len * 2, true));
@@ -682,6 +714,8 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
 
     auto end = NOW;
     auto start = end;
+    double total_gpu_cost = get_gpu_allocated();
+    FT_LOG_INFO("enter_forward_gpu_cost is %lf MB.", get_gpu_allocated());
     std::mutex mtx_tmp;
     std::unique_lock<std::mutex> forward_lock(Config::FAST_SERVE_SCHEDULER ? job->mtx_forward:mtx_tmp);
     if(Config::FAST_SERVE_SCHEDULER){
@@ -780,6 +814,7 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
         }
     }
 
+
     has_prefix_prompt_ =
         (prompt_learning_task_name_ids != nullptr && prompt_learning_type_ == PromptLearningType::prefix_prompt);
     has_p_prompt_tuning_ =
@@ -823,9 +858,15 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
         memory_len = session_len;  // When the interactive generation mode is disabled.
     }
     memory_len_ = memory_len;
+    // memory_len is the sum of input-length and output-length and 2.
+    // and the gpu cost of KV Cache is related to memory_len
+
+
     /* TODO: could remove this constraint by changing how context decoder operates */
     FT_CHECK_WITH_INFO(max_input_length <= memory_len,
                        fmtstr("Memory size too low (%d) vs. input length (%d)", memory_len, max_input_length));
+
+
 
     if (memory_len < session_len) {
         FT_LOG_WARNING("memory_len (%d) is less than session_len (%d). "
@@ -858,7 +899,13 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
                            "the cumulative log probability computation of input contexts.");
     }
 
+    // occupy 0MB gpu memory above.
+
+
+    // occupy gpu memory here, including KV Cache, relating to input-length and output-length
     PUSH_RANGE("buffer allocation");
+    double allocateBuffer_gpu_cost = get_gpu_allocated();
+//    FT_LOG_INFO("INIT MEMORY COST IS %lf.",get_gpu_allocated());
     if (!continue_gen) {
         allocateBuffer(batch_size,
                        beam_width,
@@ -868,6 +915,10 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
                        is_return_context_cum_log_probs);
         sync_check_cuda_error();
     }
+//    FT_LOG_INFO("AFTER MEMORY COST IS %lf.",get_gpu_allocated());
+    allocateBuffer_gpu_cost = get_gpu_allocated() - allocateBuffer_gpu_cost;
+    FT_LOG_INFO("allocateBuffer_gpu_cost is %lf MB.",allocateBuffer_gpu_cost);
+
     setSeqLimitLen(seq_limit_len_, input_tensors->at("output_seq_len"), limit_len_offset, batch_size);
     POP_RANGE;
 
@@ -880,6 +931,9 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
                                                     size_per_head_ / (16 / sizeof(T)),
                                                     memory_len,
                                                     16 / sizeof(T)};
+
+    // dynamic_decode_layer_ occupy gpu memory about 1.55 MB.
+    double dynamic_decode_layer_gpu_cost = get_gpu_allocated();
     const std::vector<size_t> self_v_cache_shape = {
         num_layer_ / pipeline_para_.world_size_, batch_size * beam_width, local_head_num_, memory_len, size_per_head_};
 
@@ -892,6 +946,8 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
         handleOptArg(&input_map, "end_id", end_ids_buf_, end_id_, batch_size);
         POP_RANGE;
     }
+    dynamic_decode_layer_gpu_cost = get_gpu_allocated() - dynamic_decode_layer_gpu_cost;
+    FT_LOG_INFO("dynamic_decode_layer_gpu_cost is %lf MB.",dynamic_decode_layer_gpu_cost);
 
     if (gpt_variant_params_.use_attention_linear_bias) {
         PUSH_RANGE("build alibi slopes");
@@ -899,6 +955,7 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
         POP_RANGE;
     }
 
+    double gpt_context_decoder_gpu_cost = get_gpu_allocated();
     if (continue_gen) {
         PUSH_RANGE("input tiling and init");
         invokeTileGptInputs(tiled_input_ids_buf_,
@@ -1020,6 +1077,7 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
         }
         POP_RANGE;
 
+        // max_input_length is always bigger than 1
         // handle first step
         if (has_p_prompt_tuning_ || has_prefix_prompt_ || has_prefix_soft_prompt_ || max_input_length > 1) {
             PUSH_RANGE("input tiling and init");
@@ -1158,9 +1216,11 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
 
             // TODO:这里是第一个token生成前的主要耗时点，如果仅根据输入来进行预测的话，这里需要研究
             auto tmpStart = NOW;
+
             gpt_context_decoder_->forward(
                 &decoder_output_tensors, &decoder_input_tensors, &gpt_weights->decoder_layer_weights);
             FT_LOG_INFO("Before generating the first token, the context_decoder cost %lfms", DURATION(tmpStart));
+            FT_LOG_INFO("gpt_context_decoder_gpu_cost is %lf MB.", gpt_context_decoder_gpu_cost = get_gpu_allocated()-gpt_context_decoder_gpu_cost);
 
             if (is_return_context_embeddings) {
                 PUSH_RANGE("context embedding sum length dim");
@@ -1266,19 +1326,37 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
     const size_t local_batch_size = getLocalBatchSize(batch_size, 1, pipeline_para_.world_size_);
     FT_CHECK(batch_size % local_batch_size == 0);
     const size_t iteration_num = batch_size / local_batch_size;
+
     for (int microbatch = 0; microbatch < iteration_num; ++microbatch) {
         microbatch_should_stop_[microbatch] = false;
     }
+    FT_LOG_INFO("total_gpu_cost in forward is %lf MB.",total_gpu_cost = get_gpu_allocated() - total_gpu_cost);
+    FT_LOG_INFO("gpu_cost is %lf MB.", get_gpu_allocated());
+//    FT_LOG_INFO("sum of gpu memory is %lf MB.", get_gpu_allocated() + get_gpu_free());
+//    std::this_thread::sleep_for(std::chrono::seconds(2000));
 
+//    double tmp1 = get_gpu_allocated();
+//    FT_LOG_INFO("cost cache %lf MB.",tmp1-tmp0);
     for (step_ = step_start; step_ < (int)gen_len; step_++) {
         // Loop body produces Nth token by embedding && encoding token (N-1)
         // if necessary.
+        FT_LOG_INFO("[init] gpu_cost is %lf MB.", get_gpu_allocated());
+        offloading();
+        if(step_!=step_start){
+            std::this_thread::sleep_for(std::chrono::seconds(100));
+        }
+        FT_LOG_INFO("After offLoading, gpu_cost is %lf MB.", get_gpu_allocated());
+        std::this_thread::sleep_for(std::chrono::seconds(5));
         if(Config::FAST_SERVE_SCHEDULER){
             if(step_!=step_start){
                 forward_lock.lock();
                 job->cv_gpt_forward.wait(forward_lock,[&job](){return job->job_quantum>0;});
             }
         }
+        uploading();
+//        std::this_thread::sleep_for(std::chrono::seconds(3));
+        FT_LOG_INFO("After upLoading, gpu_cost is %lf MB.", get_gpu_allocated());
+        std::this_thread::sleep_for(std::chrono::seconds(10));
         const bool fill_caches_only = continue_gen && (step_ < max_context_len);
         const int  src_indir_idx    = (step_ - step_start) % 2;
         const int  tgt_indir_idx    = 1 - src_indir_idx;
@@ -1657,7 +1735,7 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
         auto duration = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>( end-start);
         start = end;
 
-        FT_LOG_INFO("token-{%d}, time = {%lf}ms",step_,duration.count());
+//        FT_LOG_INFO("token-{%d}, time = {%lf}ms",step_,duration.count());
 
         /*if(step_==step_start){
             FT_LOG_INFO("token-{%d}, time = {%lf}ms",step_,duration.count());
@@ -1677,9 +1755,13 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
     }
 //    FT_LOG_INFO("generated {%d} tokens.",step_-step_start);
     PUSH_RANGE("communicate tensors");
+
     setOutputTensors(
         output_tensors, input_tensors, gen_len, session_len, max_context_len, max_input_without_prompt_length);
     sendTensorsToFirstPipelineNode(output_tensors, input_tensors);
+
+
+
     POP_RANGE;
 }
 
