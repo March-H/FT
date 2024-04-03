@@ -10,6 +10,7 @@
 #include <vector>
 #include "config.h"
 #include "src/fastertransformer/utils/logger.h"
+#include "Channel.h"
 
 struct Job{
 public:
@@ -23,21 +24,24 @@ public:
     bool is_job_done = false;
     int job_quantum = 0;
     int job_priority = 0;
+    bool KV_loaded = false;
+    bool loading = false;
+    Channel<int> forward_chan, cache_chan;
 
-
-    std::mutex mtx, mtx_forward; // job - Parallel
-    std::unique_lock<std::mutex> lock_forward; // job - Scheduler
-    std::condition_variable cv_gpt_forward, cv_job_join;
+    std::mutex mtx; // job - Parallel
 
     Job(int job_id, int input_length);
     ~Job();
 
-    [[nodiscard]] bool is_starving() const;
+    [[nodiscard]] bool is_starving();
     void update_job_priority(int priority, int quantum);
 
     void generated_one_token(bool done = false);
 
     void start_iteration();
+    void upload();
+    bool check_KV_loaded();
+    void set_KV_loaded(bool flag);
     [[nodiscard]] bool finish_iteration();
     [[nodiscard]] bool check_job_done();
 

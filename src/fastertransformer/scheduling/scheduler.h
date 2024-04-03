@@ -29,7 +29,8 @@ public:
     int quantum_of_mlfq[Config::MLFQ_QUEUE_NUMBE];
     int total_job = 0;
     double JCT = 0;
-    bool is_scheduling=false;
+    bool is_scheduling = false;
+    int MAX_READY_SIZE = std::max(16, Config::MAX_BATCH_SIZE);
 
     std::mutex mtx;
 

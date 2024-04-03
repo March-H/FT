@@ -82,6 +82,7 @@ void ParallelGpt<T>::offloading()
 {
     // sync offloading
 //    FT_LOG_INFO("[BEFORE OFFLOADING]The pointer address is %p",key_cache_);
+//    FT_LOG_INFO("offload KV Cache.");
     key_cache_ = (T*)allocator_->moveTo(key_cache_, sizeof(T) * kv_cache_size * 2, true);
 //    FT_LOG_INFO("[AFTER OFFLOADING]The pointer address is %p",key_cache_);
 }
@@ -91,6 +92,7 @@ void ParallelGpt<T>::uploading()
 {
     // sync uploading
 //    FT_LOG_INFO("[BEFORE UPLOADING]The pointer address is %p",key_cache_);
+//    FT_LOG_INFO("upload KV Cache.");
     key_cache_ = (T*)allocator_->moveTo(key_cache_, sizeof(T) * kv_cache_size * 2, false);
 //    FT_LOG_INFO("[AFTER UPLOADING]The pointer address is %p",key_cache_);
 }
@@ -714,13 +716,15 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
 
     auto end = NOW;
     auto start = end;
-    double total_gpu_cost = get_gpu_allocated();
-    FT_LOG_INFO("enter_forward_gpu_cost is %lf MB.", get_gpu_allocated());
-    std::mutex mtx_tmp;
-    std::unique_lock<std::mutex> forward_lock(Config::FAST_SERVE_SCHEDULER ? job->mtx_forward:mtx_tmp);
-    if(Config::FAST_SERVE_SCHEDULER){
-        job->cv_gpt_forward.wait(forward_lock, [&job](){return job->job_quantum>0;});
-    }
+//    double total_gpu_cost = get_gpu_allocated();
+//    FT_LOG_INFO("enter_forward_gpu_cost is %lf MB.", get_gpu_allocated());
+    FT_LOG_INFO("Job(%d) ENTER FORWARD.",job->job_id);
+//    std::mutex mtx_tmp0, mtx_tmp1;
+//    std::unique_lock<std::mutex> cache_lock(Config::FAST_SERVE_SCHEDULER ? job->mtx_cahce:mtx_tmp1,std::defer_lock);
+//    std::unique_lock<std::mutex> forward_lock(Config::FAST_SERVE_SCHEDULER ? job->mtx_forward:mtx_tmp0,std::defer_lock);
+//    if(Config::FAST_SERVE_SCHEDULER){
+//        job->cv_gpt_forward.wait(forward_lock, [&job](){return job->job_quantum>0;});
+//    }
     int   input_length      = (int)input_tensors->at("input_ids").shape[1] - 1;
 //    if(outfile.is_open()){
 //        outfile << input_length << " ";
@@ -901,6 +905,15 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
 
     // occupy 0MB gpu memory above.
 
+    // wait the cache_lock to upload KV Cache for the first time.
+    FT_LOG_INFO("Job(%d) wait cache lock and upload first time.",job->job_id);
+//    cache_lock.lock();
+//    FT_LOG_INFO("Job(%d) got cache lock and upload first time.",job->job_id);
+    if(Config::FAST_SERVE_SCHEDULER){
+//        job->cv_cache_join.wait(cache_lock);
+        int tmp = job->cache_chan.receive();
+    }
+    FT_LOG_INFO("Job(%d) upload KV Cache for the first time.",job->job_id);
 
     // occupy gpu memory here, including KV Cache, relating to input-length and output-length
     PUSH_RANGE("buffer allocation");
@@ -917,7 +930,7 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
     }
 //    FT_LOG_INFO("AFTER MEMORY COST IS %lf.",get_gpu_allocated());
     allocateBuffer_gpu_cost = get_gpu_allocated() - allocateBuffer_gpu_cost;
-    FT_LOG_INFO("allocateBuffer_gpu_cost is %lf MB.",allocateBuffer_gpu_cost);
+//    FT_LOG_INFO("allocateBuffer_gpu_cost is %lf MB.",allocateBuffer_gpu_cost);
 
     setSeqLimitLen(seq_limit_len_, input_tensors->at("output_seq_len"), limit_len_offset, batch_size);
     POP_RANGE;
@@ -947,7 +960,7 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
         POP_RANGE;
     }
     dynamic_decode_layer_gpu_cost = get_gpu_allocated() - dynamic_decode_layer_gpu_cost;
-    FT_LOG_INFO("dynamic_decode_layer_gpu_cost is %lf MB.",dynamic_decode_layer_gpu_cost);
+//    FT_LOG_INFO("dynamic_decode_layer_gpu_cost is %lf MB.",dynamic_decode_layer_gpu_cost);
 
     if (gpt_variant_params_.use_attention_linear_bias) {
         PUSH_RANGE("build alibi slopes");
@@ -1330,33 +1343,59 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
     for (int microbatch = 0; microbatch < iteration_num; ++microbatch) {
         microbatch_should_stop_[microbatch] = false;
     }
-    FT_LOG_INFO("total_gpu_cost in forward is %lf MB.",total_gpu_cost = get_gpu_allocated() - total_gpu_cost);
-    FT_LOG_INFO("gpu_cost is %lf MB.", get_gpu_allocated());
+//    FT_LOG_INFO("total_gpu_cost in forward is %lf MB.",total_gpu_cost = get_gpu_allocated() - total_gpu_cost);
+//    FT_LOG_INFO("gpu_cost is %lf MB.", get_gpu_allocated());
 //    FT_LOG_INFO("sum of gpu memory is %lf MB.", get_gpu_allocated() + get_gpu_free());
 //    std::this_thread::sleep_for(std::chrono::seconds(2000));
 
 //    double tmp1 = get_gpu_allocated();
 //    FT_LOG_INFO("cost cache %lf MB.",tmp1-tmp0);
+
+    // wait the forward lock to start to generate token.
+    job->set_KV_loaded(true);
+    FT_LOG_INFO("Job(%d) finish upload KV Cache first time.",job->job_id);
+//    forward_lock.lock();
+    if(Config::FAST_SERVE_SCHEDULER){
+        int tmp = job->forward_chan.receive();
+//        while(job->job_quantum <= 0){
+//            job->cv_gpt_forward.wait(forward_lock);
+//        }
+    }
+    FT_LOG_INFO("Job(%d) start to generate first token.",job->job_id);
+
     for (step_ = step_start; step_ < (int)gen_len; step_++) {
         // Loop body produces Nth token by embedding && encoding token (N-1)
         // if necessary.
-        FT_LOG_INFO("[init] gpu_cost is %lf MB.", get_gpu_allocated());
-        offloading();
-        if(step_!=step_start){
-            std::this_thread::sleep_for(std::chrono::seconds(100));
-        }
-        FT_LOG_INFO("After offLoading, gpu_cost is %lf MB.", get_gpu_allocated());
-        std::this_thread::sleep_for(std::chrono::seconds(5));
+
+//        FT_LOG_INFO("[init] gpu_cost is %lf MB.", get_gpu_allocated());
+//        offloading();
+//        FT_LOG_INFO("After offLoading, gpu_cost is %lf MB.", get_gpu_allocated());
+//        std::this_thread::sleep_for(std::chrono::seconds(5));
+
         if(Config::FAST_SERVE_SCHEDULER){
             if(step_!=step_start){
-                forward_lock.lock();
-                job->cv_gpt_forward.wait(forward_lock,[&job](){return job->job_quantum>0;});
+                // 优先尝试获取cache锁
+                FT_LOG_INFO("Job(%d) try to check own cache lock.",job->job_id);
+                if(!job->check_KV_loaded()){
+                    int op = job->cache_chan.receive();
+                    uploading();
+                    job->set_KV_loaded(true);
+                }
+                FT_LOG_INFO("wait forward signal.");
+                while(job->forward_chan.receive()!=1);
+//                forward_lock.lock();
+//                job->cv_gpt_forward.wait(forward_lock,[&job](){return job->job_quantum>0;});
+                FT_LOG_INFO("Job(%d) start to generate the %d token.",job->job_id,step_);
             }
         }
-        uploading();
+
+
+
+//        uploading();
 //        std::this_thread::sleep_for(std::chrono::seconds(3));
-        FT_LOG_INFO("After upLoading, gpu_cost is %lf MB.", get_gpu_allocated());
-        std::this_thread::sleep_for(std::chrono::seconds(10));
+//        FT_LOG_INFO("After upLoading, gpu_cost is %lf MB.", get_gpu_allocated());
+//        std::this_thread::sleep_for(std::chrono::seconds(10));
+
         const bool fill_caches_only = continue_gen && (step_ < max_context_len);
         const int  src_indir_idx    = (step_ - step_start) % 2;
         const int  tgt_indir_idx    = 1 - src_indir_idx;
@@ -1743,8 +1782,35 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
 //            outfile.close();
         }*/
         if(Config::FAST_SERVE_SCHEDULER){
-            forward_lock.unlock();
+            FT_LOG_INFO("Job(%d) finish generating the %d token.",job->job_id,step_);
+//            forward_lock.unlock();
+//            cache_lock.unlock();
+//            FT_LOG_INFO("Job(%d) free two lock",job->job_id);
             job->generated_one_token(generation_should_stop||step_==gen_len-1);
+            FT_LOG_INFO("Job(%d) get op from cache chan.",job->job_id);
+            int op = job->cache_chan.receive();
+            FT_LOG_INFO("Job(%d) reveive op %d.",job->job_id,op);
+            if(op == 0){
+                FT_LOG_INFO("Job(%d) useup quantum and need to offload.",job->job_id);
+                FT_LOG_INFO("Job(%d) offload KV Cache.",job->job_id);
+                job->set_KV_loaded(false);
+                offloading();
+            }else{
+                FT_LOG_INFO("Job(%d) maintain KV Cache.",job->job_id);
+            }
+//            if(op == 0){
+//                FT_LOG_INFO("Job(%d) maintain cache lock, keep KV Cache.0",job->job_id);
+//                cache_lock.lock();
+//            }else{
+//
+//                int value = job->Cache_should_offload.receive();
+//                if(value == 1){
+//
+//                }else{
+//                    FT_LOG_INFO("Job(%d) maintain cache lock, keep KV Cache.1",job->job_id);
+//                    cache_lock.lock();
+//                }
+//            }
         }
 
         if (generation_should_stop) {

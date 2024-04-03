@@ -17,7 +17,8 @@ namespace Config{
     const int MLFQ_QUEUE_NUMBE = 8;
     const int Quantum_Ratio = 2;
     const int MAX_BATCH_SIZE = 16;
-    const bool FAST_SERVE_SCHEDULER = false;
+    const bool FAST_SERVE_SCHEDULER = true;
+//    const int K = 20;
 
     static double interval(TimePoint start, TimePoint end = NOW){
         return (double)(end-start).count()/(1000.0 * 1000.0);

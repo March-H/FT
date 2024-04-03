@@ -11,13 +11,8 @@
 #include "config.h"
 
 bool Scheduler::check_new_jobs_empty() {
-    mtx.lock();
-    if (new_jobs.empty()) {
-        mtx.unlock();
-        return true;
-    }
-    mtx.unlock();
-    return false;
+    std::unique_lock<std::mutex> lock(mtx);
+    return new_jobs.empty();
 }
 
 //bool Scheduler::check_running_jobs_empty() {
@@ -31,30 +26,18 @@ bool Scheduler::check_new_jobs_empty() {
 //}
 
 bool Scheduler::check_ready_jobs_empty() {
-//    mtx.lock();
-    if (ready_jobs.empty()) {
-//        mtx.unlock();
-        return true;
-    }
-//    mtx.unlock();
-    return false;
+    std::unique_lock<std::mutex> lock(mtx);
+    return ready_jobs.empty();
 }
 
 bool Scheduler::check_mlfq_empty(int id) {
-//    mtx.lock();
-    if (mlfq[id].empty()) {
-        mtx.unlock();
-        return true;
-    }
-//    mtx.unlock();
-    return false;
+    std::unique_lock<std::mutex> lock(mtx);
+    return mlfq[id].empty();
 }
 
 size_t Scheduler::get_ready_jobs_size() {
-//    mtx.lock();
-    size_t tmp = ready_jobs.size();
-//    mtx.unlock();
-    return tmp;
+    std::unique_lock<std::mutex> lock(mtx);
+    return ready_jobs.size();
 }
 
 void Scheduler::get_initial_priority_quantum(int length,int &priority, int &quantum) {
@@ -90,19 +73,18 @@ void Scheduler::FastServe_scheduler(){
     std::queue<Job*> tmp;
     Job *job;
     while (is_scheduling) {
-//        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
 //        FT_LOG_INFO("Process newly arrived jobs.");
         while (!check_new_jobs_empty()) {
-            mtx.lock();
+            std::unique_lock<std::mutex> lock(mtx);
             job = new_jobs.front();
             new_jobs.pop_front();
-            mtx.unlock();
             int init_priority;
             int init_quantum;
             get_initial_priority_quantum(job->input_length,init_priority,init_quantum);
-//            FT_LOG_INFO("Scheduler got job(%d), length(%d), priority(%d).", new_job->job_id, new_job->input_length,
-//                   init_priority);
+            FT_LOG_INFO("Scheduler got job(%d), length(%d), priority(%d).", job->job_id, job->input_length,
+                   init_priority);
             job->update_job_priority(init_priority, init_quantum);
             this->mlfq[init_priority].push_back(job);
         }
@@ -126,32 +108,38 @@ void Scheduler::FastServe_scheduler(){
             }
         }
 
-//        FT_LOG_INFO("Schedule jobs to be executed.");
-        for (int i = 0; i < Config::MLFQ_QUEUE_NUMBE; ++i) {
-            while (!check_mlfq_empty(i) && get_ready_jobs_size() + running_jobs.size() < Config::MAX_BATCH_SIZE) {
-                job = mlfq[i].front();
-                mlfq[i].pop_front();
-                ready_jobs.push_back(job);
-//                FT_LOG_INFO("Send job(%d) to be executed.", job->job_id);
-            }
-        }
-
-//        FT_LOG_INFO("Wait and demote preempted jobs.");
+        //    FT_LOG_INFO("Wait and demote preempted jobs.");
         auto it = running_jobs.begin();
         while(it != running_jobs.end()){
+//            FT_LOG_INFO("Job(%d) check finish iteration?",job->job_id);
             if(!(*it)->finish_iteration()){
+//                FT_LOG_INFO("Job(%d) don't finish iteration.",job->job_id);
                 ++it;
                 continue;
             }else{
+                FT_LOG_INFO("Job(%d) finish iteration.",job->job_id);
                 job = (*it);
                 running_jobs.erase(it);
+                FT_LOG_INFO("Job(%d) check job done?",job->job_id);
                 if (!job->check_job_done()){
                     int demoted_priority = get_next_priority(job->job_priority);
                     job->update_job_priority(demoted_priority, quantum_of_mlfq[demoted_priority]);
-                    mtx.lock();
+                    int num=0;
+                    for(int i=0;i<=demoted_priority;++i){
+                        num += mlfq[i].size();
+                    }
+                    if(num + 1 <= MAX_READY_SIZE - get_ready_jobs_size()){
+                        FT_LOG_INFO("Job(%d) needn't to offload KV Cache.",job->job_id);
+                        job->cache_chan.send(1);
+                    }else{
+                        FT_LOG_INFO("Job(%d) should offload KV Cache.",job->job_id);
+//                        job->Cache_should_offload.send(1);
+                        job->cache_chan.send(0);
+                    }
                     mlfq[demoted_priority].push_back(job);
-                    mtx.unlock();
                 }else{
+                    FT_LOG_INFO("Job(%d) finish.",job->job_id);
+                    job->cache_chan.send(1);
                     double duration = DURATION(job->recieveTime);
                     JCT = total_job * JCT + duration/1000.0;
                     total_job++;
@@ -166,14 +154,57 @@ void Scheduler::FastServe_scheduler(){
             }
         }
 
+//        FT_LOG_INFO("Schedule jobs to be executed.");
+        for (int i = 0; i < Config::MLFQ_QUEUE_NUMBE; ++i) {
+            while (!check_mlfq_empty(i) && get_ready_jobs_size() < MAX_READY_SIZE) {
+                job = mlfq[i].front();
+                job->upload();
+//                FT_LOG_INFO("upload KV Cache of job %d.",job->job_id);
+                mlfq[i].pop_front();
+                ready_jobs.push_back(job);
+                FT_LOG_INFO("Send job(%d) to be executed.", job->job_id);
+            }
+        }
+
+
 //        FT_LOG_INFO("Start scheduled jobs.\n");
-        while (!check_ready_jobs_empty()) {
+        auto ti = ready_jobs.begin();
+        bool needExpand = running_jobs.size()<Config::MAX_BATCH_SIZE;
+        while(ti != ready_jobs.end() && running_jobs.size()<Config::MAX_BATCH_SIZE){
+            if((*ti)->check_KV_loaded()){
+                needExpand = false;
+                ready_jobs.erase(ti);
+                (*ti)->start_iteration();
+                FT_LOG_INFO("Job(%d) start iteration.", (*ti)->job_id);
+                running_jobs.push_back((*ti));
+            }else{
+                ti++;
+            }
+        }
+        // if running_jobs have vacancy but ready_jobs are full and no KV_loaded job can be iterated
+        if(needExpand && get_ready_jobs_size()==MAX_READY_SIZE){
+            MAX_READY_SIZE++;
+        }
+        else // if KV_loaded job in ready_jobs exceed Config::MAX_BATCH_SIZE
+        {
+            ti = ready_jobs.begin();
+            int cnt=0;
+            while(ti != ready_jobs.end()){
+                if((*ti)->check_KV_loaded()){
+                    cnt++;
+                }
+            }
+            if(cnt>Config::MAX_BATCH_SIZE){
+                MAX_READY_SIZE--;
+            }
+        }
+        /*while (!check_ready_jobs_empty() && running_jobs.size()<Config::MAX_BATCH_SIZE) {
             job = ready_jobs.front();
             ready_jobs.pop_front();
             job->start_iteration();
-//            FT_LOG_INFO("Job(%d) start iteration.", job->job_id);
+            FT_LOG_INFO("Job(%d) start iteration.", job->job_id);
             running_jobs.push_back(job);
-        }
+        }*/
     }
 }
 
@@ -213,25 +244,25 @@ Job* Scheduler::allocate_new_job(int jobId, int inputLength) {
 //        std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int64_t>(1000.0/poissonValues[i])));
 //        inputFile>>input_length>>output_length;
 //        Job *job = jobMaker(input_length,output_length);
-//        mtx.lock();
+//        lock_mtx.lock();
 //        new_jobs.push_back(job);
-//        mtx.unlock();
+//        lock_mtx.unlock();
 //    }
 
 //    FT_LOG_INFO("Scheduler add job-{%d}.",jobId);
 //    FT_LOG_INFO("third step.");
+    FT_LOG_INFO("create job %d",jobId);
+    std::unique_lock<std::mutex> lock(mtx);
     Job* job = new Job(jobId,inputLength);
 //    FT_LOG_INFO("fourth step.");
-    mtx.lock();
     new_jobs.push_back(job);
-    mtx.unlock();
+    FT_LOG_INFO("finish create job %d",jobId);
 
     return job;
 }
 
-Scheduler::Scheduler(int mode): scheduler_mode(mode){
+Scheduler::Scheduler(int mode): scheduler_mode(mode), mtx(){
 //    FT_LOG_INFO("[Scheduler] scheduler initialization.");
-
     int quantum = 1;
     for(int i=0;i<Config::MLFQ_QUEUE_NUMBE;++i){
         quantum_of_mlfq[i] = quantum;
